@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from ..models import FileEntry, ScanResult
+from ..preview import PREVIEW_MAX_BYTES, PreviewResult, preview_file
 from ..scanner import ScanError, filter_entries, format_mtime, format_size, scan_directory
 
 # Centralized theme.
@@ -17,6 +18,7 @@ MUTED = "#9a9aa6"
 ACCENT = "#8b5cf6"
 ACCENT_HOVER = "#a78bfa"
 POLL_MS = 50
+PREVIEW_POLL_MS = 60
 
 
 class MainWindow:
@@ -27,12 +29,18 @@ class MainWindow:
         self.status = tk.StringVar(value="Choose a folder to begin.")
         self.filter_var = tk.StringVar(value="")
         self.recursive_var = tk.BooleanVar(value=False)
+        self.preview_status = tk.StringVar(value="Select a file to preview.")
         self._queue: queue.Queue = queue.Queue()
         self._cancel = threading.Event()
         self._worker: threading.Thread | None = None
         self._last_result: ScanResult | None = None
+        self._row_entries: dict[str, FileEntry] = {}
         self._sort_col = "name"
         self._sort_desc = False
+        self._preview_queue: queue.Queue = queue.Queue()
+        self._preview_seq = 0
+        self._preview_active = False
+        self._preview_polling = False
 
         root.title("GhostVault")
         root.geometry("1020x560")
@@ -109,6 +117,28 @@ class MainWindow:
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.request_preview())
+
+        pv = ttk.Frame(self.root)
+        pv.pack(fill="both", expand=False, **pad)
+        ttk.Label(pv, text="Preview", style="Muted.TLabel").pack(anchor="w")
+        pf = ttk.Frame(pv)
+        pf.pack(fill="both", expand=True)
+        self.preview_text = tk.Text(pf, height=8, wrap="none", state="disabled",
+                                    bg=PANEL, fg=FG, insertbackground=FG,
+                                    selectbackground=ACCENT, relief="flat",
+                                    font=("Consolas", 10), padx=6, pady=6)
+        pv_vsb = ttk.Scrollbar(pf, orient="vertical", command=self.preview_text.yview)
+        pv_hsb = ttk.Scrollbar(pf, orient="horizontal", command=self.preview_text.xview)
+        self.preview_text.configure(yscrollcommand=pv_vsb.set,
+                                    xscrollcommand=pv_hsb.set)
+        self.preview_text.grid(row=0, column=0, sticky="nsew")
+        pv_vsb.grid(row=0, column=1, sticky="ns")
+        pv_hsb.grid(row=1, column=0, sticky="ew")
+        pf.grid_rowconfigure(0, weight=1)
+        pf.grid_columnconfigure(0, weight=1)
+        ttk.Label(pv, textvariable=self.preview_status, style="Muted.TLabel",
+                  anchor="w").pack(fill="x")
 
         footer = ttk.Frame(self.root)
         footer.pack(fill="x", pady=8, **pad)
@@ -169,6 +199,7 @@ class MainWindow:
     def _show_result(self, result: ScanResult) -> None:
         self._last_result = result
         self._render_rows()
+        self._clear_preview("Select a file to preview.")
         self.summary.set(f"Files: {len(result.entries)}   "
                          f"Total size: {format_size(result.total_size)}")
         note = f" ({result.skipped} skipped)" if result.skipped else ""
@@ -201,10 +232,90 @@ class MainWindow:
             self.tree.delete(*self.tree.get_children())
         except Exception:
             return
+        self._row_entries = {}
         for e in self._sorted_filtered():
-            self.tree.insert("", "end", values=(
+            iid = self.tree.insert("", "end", values=(
                 e.name, e.extension or "(none)",
                 format_size(e.size), format_mtime(e.mtime), e.location))
+            self._row_entries[iid] = e
+
+    # ---- preview (worker never touches widgets) ----
+    def request_preview(self) -> None:
+        sel = self.tree.selection()
+        entry = self._row_entries.get(sel[0]) if sel else None
+        if entry is None:
+            self._clear_preview("Select a file to preview.")
+            return
+        self._preview_seq += 1
+        self._preview_active = True
+        self._set_preview_text("", f"Loading preview of {entry.name}…")
+        seq = self._preview_seq
+        threading.Thread(target=self._preview_worker,
+                         args=(str(entry.path), seq), daemon=True).start()
+        if not self._preview_polling:
+            self._preview_polling = True
+            self.root.after(PREVIEW_POLL_MS, self._poll_preview)
+
+    def _preview_worker(self, path: str, seq: int) -> None:
+        try:
+            result = preview_file(path, PREVIEW_MAX_BYTES)
+        except Exception as exc:  # last-resort guard; details are logged
+            import logging
+            from pathlib import Path
+            logging.getLogger(__name__).exception("Unexpected preview failure")
+            result = PreviewResult(Path(path), "inaccessible",
+                                   notice=f"Unexpected error: {exc}")
+        self._preview_queue.put((seq, result))
+
+    def _poll_preview(self) -> None:
+        try:
+            while True:
+                seq, result = self._preview_queue.get_nowait()
+                if seq == self._preview_seq and self._preview_active:
+                    self._preview_active = False
+                    self._render_preview(result)
+                # else: stale result from an earlier selection, drop it
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            self._preview_polling = False
+            return
+        try:
+            if self._preview_active:
+                self.root.after(PREVIEW_POLL_MS, self._poll_preview)
+            else:
+                self._preview_polling = False
+        except tk.TclError:
+            self._preview_polling = False
+
+    def _render_preview(self, result: PreviewResult) -> None:
+        try:
+            if result.status in ("text", "empty"):
+                header = result.path.name
+                if result.size >= 0:
+                    header += f" — {format_size(result.size)}"
+                body = result.text if result.text else "(empty file)"
+                self._set_preview_text(body, header)
+            else:
+                self._set_preview_text("", result.notice or "Preview unavailable.")
+        except tk.TclError:
+            pass
+
+    def _set_preview_text(self, body: str, status: str) -> None:
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", "end")
+        if body:
+            self.preview_text.insert("1.0", body)
+        self.preview_text.configure(state="disabled")
+        self.preview_status.set(status)
+
+    def _clear_preview(self, message: str = "Select a file to preview.") -> None:
+        self._preview_seq += 1  # invalidate any in-flight worker
+        self._preview_active = False
+        try:
+            self._set_preview_text("", message)
+        except tk.TclError:
+            pass
 
     def _set_busy(self, busy: bool) -> None:
         self.choose_btn.configure(state="disabled" if busy else "normal")
@@ -217,4 +328,6 @@ class MainWindow:
 
     def _on_close(self) -> None:
         self._cancel.set()
+        self._preview_seq += 1
+        self._preview_active = False
         self.root.destroy()
