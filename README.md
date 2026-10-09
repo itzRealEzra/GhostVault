@@ -1,7 +1,8 @@
 # GhostVault
 
 Windows desktop utility to scan folders and (in later milestones) safely organize files.
-Status: Milestone 1 — read-only scanning. Nothing is moved, renamed, or deleted.
+Status: Milestone 2 — read-only scanning (recursive optional, filter, sorting).
+Nothing is moved, renamed, or deleted.
 
 ## Run
 Requires Python 3.10+ with Tkinter (included in the standard Windows installer).

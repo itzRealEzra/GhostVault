@@ -1,1 +1,1 @@
-# Milestone 1 uses the Python standard library only (Tkinter, pathlib, os, threading, queue).
+# Milestone 2 uses the Python standard library only (Tkinter, pathlib, os, threading, queue, datetime).
